@@ -1,0 +1,635 @@
+# FindSimilarity: A Framework for Inter-Cluster Distance Analysis in Seurat
+
+**Design Document — Version 0.1 — Draft for Internal Review**
+**March 2026**
+
+*Status: Design Phase — Pre-Implementation*
+*Target: Seurat v5.x Pull Request + Methods Paper*
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [Motivation and Gap Analysis](#2-motivation-and-gap-analysis)
+3. [API Design](#3-api-design)
+4. [Internal Architecture](#4-internal-architecture)
+5. [Distance Methods: Definitions and Properties](#5-distance-methods-definitions-and-properties)
+6. [Open Design Decisions](#6-open-design-decisions)
+7. [Experimental Validation Plan](#7-experimental-validation-plan)
+8. [Implementation Roadmap](#8-implementation-roadmap)
+9. [Methods Paper Outline](#9-methods-paper-outline)
+10. [Risks and Mitigations](#10-risks-and-mitigations)
+11. [Glossary](#11-glossary)
+
+---
+
+## 1. Executive Summary
+
+This document describes the design, implementation plan, and experimental validation strategy for **FindSimilarity**, a proposed family of functions for the Seurat single-cell analysis framework. These functions enable systematic quantification of distances and similarities between cell clusters in latent embedding spaces (PCA, Harmony, scVI, etc.), filling a significant gap in the current single-cell analysis toolkit.
+
+The core contribution is a unified, extensible API that supports multiple distance metrics, operates at three levels of comparison (cluster-to-cluster, condition-within-cluster, and cross-condition interaction), and follows Seurat's established naming conventions and design patterns. The framework comprises four functions: **FindSimilarity**, **FindAllSimilarity**, **FindConservedSimilarity**, and **FindDivergence**.
+
+This document serves two purposes: (1) as an engineering specification for implementation, and (2) as the foundation for a methods paper documenting the framework and the empirical evaluation of design choices.
+
+---
+
+## 2. Motivation and Gap Analysis
+
+### 2.1 The Problem
+
+UMAP and t-SNE are the dominant visualisation methods in single-cell genomics, yet both explicitly sacrifice global distance fidelity for local neighbourhood preservation. Scientists routinely interpret inter-cluster distances on UMAP plots as meaningful, drawing biological conclusions from visual proximity that has no quantitative basis. Meanwhile, existing tools provide only partial solutions:
+
+- **BuildClusterTree() (Seurat):** Computes a hierarchical clustering dendrogram from cluster centroids in PCA space. Limited to one method (average linkage), does not expose pairwise distances, and cannot stratify by condition.
+- **sc.tl.dendrogram() (scanpy):** Similar to BuildClusterTree, computes a dendrogram for cluster ordering. Same limitations.
+- **PAGA (scanpy):** Partition-based Graph Abstraction computes inter-cluster connectivity based on the kNN graph. Measures topological connectivity, not geometric distance in latent space. Cannot compare conditions within clusters.
+- **scran/bluster (Bioconductor):** Offers cluster-level distance utilities but they are fragmented, not user-facing, and lack condition-stratified analysis.
+
+### 2.2 What Is Missing
+
+No existing tool provides a unified framework that:
+
+1. Computes pairwise distances between clusters in any user-specified latent space.
+2. Supports multiple distance metrics capturing different biological properties (centroid-based, distribution-based, correlation-based, graph-based).
+3. Enables within-cluster divergence analysis across experimental conditions.
+4. Provides statistical significance testing for observed distances.
+5. Integrates natively with Seurat's object model and conventions.
+
+### 2.3 Biological Use Cases
+
+- **Cell type relationship mapping:** Which clusters are most transcriptionally similar? Does the dendrogram agree with known cell type ontologies?
+- **Treatment response heterogeneity:** In a case-control study, do all clusters shift equally between conditions, or do certain populations diverge more? This directly addresses questions about cell-type-specific drug responses.
+- **Batch effect assessment:** After integration, are condition-specific distances preserved or collapsed? Compare distances in corrected vs. uncorrected spaces.
+- **Developmental trajectory validation:** Do distances in latent space recapitulate expected developmental ordering?
+- **Multi-modal concordance:** Do cluster distances agree across RNA, ATAC, and protein modalities?
+
+---
+
+## 3. API Design
+
+### 3.1 Function Family and Naming Conventions
+
+The API follows Seurat's established `Find*` family pattern:
+
+| Seurat Pattern | Our Function | Comparison Type | Analogy |
+|---|---|---|---|
+| `FindMarkers` | `FindSimilarity` | One cluster vs. one/rest | Targeted comparison |
+| `FindAllMarkers` | `FindAllSimilarity` | All pairwise clusters | Exhaustive pairwise |
+| `FindConservedMarkers` | `FindConservedSimilarity` | Between clusters, per condition | Cross-condition stability |
+| *(no analogue)* | `FindDivergence` | Within cluster, across conditions | Condition shift |
+
+### 3.2 FindSimilarity — Core Function
+
+This is the fundamental building block. All other functions in the family call FindSimilarity internally or share its core computation engine.
+
+**Signature:**
+
+```r
+FindSimilarity(
+  object,                # Seurat object
+  ident.1 = NULL,        # Reference cluster identity
+  ident.2 = NULL,        # Comparison cluster (NULL = all others)
+  reduction = "pca",     # Embedding to use
+  dims = NULL,           # Dimensions (NULL = auto-detect)
+  method = "euclidean",  # Distance metric
+  group.by = NULL,       # Override active idents
+  features = NULL,       # Gene-space mode (alternative to reduction)
+  assay = NULL,          # Assay for gene-space mode
+  slot = "data",         # Slot for gene-space mode
+  weight.by.var = FALSE, # Weight dims by variance explained
+  n.perm = 0,            # Permutation tests (0 = off)
+  min.cells = 10,        # Minimum cells per group
+  seed = 42,             # Random seed for reproducibility
+  verbose = TRUE,        # Progress messages
+  ...                    # Method-specific arguments
+)
+```
+
+**Return:** A data frame with columns: `cluster`, `distance`, `n.cells.1`, `n.cells.2`, `rank`, and optionally `p.value`, `p.value.adj.bonf`, `p.value.adj.bh`. Sorted by distance ascending (most similar first).
+
+### 3.3 FindAllSimilarity
+
+Iterates FindSimilarity over all clusters, producing a full pairwise distance matrix. Analogous to `FindAllMarkers`.
+
+**Signature:**
+
+```r
+FindAllSimilarity(
+  object,
+  reduction = "pca",
+  dims = NULL,
+  method = "euclidean",
+  group.by = NULL,
+  return.matrix = TRUE,  # TRUE = dist matrix, FALSE = long table
+  ...                    # Passed to FindSimilarity
+)
+```
+
+**Return:** When `return.matrix = TRUE`, a symmetric distance matrix (class `dist` or `matrix`). When `FALSE`, a long-format data frame with columns: `cluster.1`, `cluster.2`, `distance`, `rank`.
+
+### 3.4 FindConservedSimilarity
+
+For a given pair of clusters, computes their distance within each level of a grouping variable, then tests whether the distance is conserved across conditions. Analogous to `FindConservedMarkers`.
+
+**Signature:**
+
+```r
+FindConservedSimilarity(
+  object,
+  ident.1,
+  ident.2 = NULL,
+  grouping.var,          # Metadata column to stratify by
+  reduction = "pca",
+  method = "euclidean",
+  meta.method = "fisher",# How to combine per-condition results
+  ...
+)
+```
+
+**Return:** Data frame with per-condition distances, a combined/meta-analytic p-value, and a measure of cross-condition variance in distance.
+
+### 3.5 FindDivergence
+
+Measures within-cluster shifts across conditions. For each cluster, splits cells by a metadata variable and computes the distance between condition sub-populations. Answers: "How much does this cluster change between conditions?"
+
+**Signature:**
+
+```r
+FindDivergence(
+  object,
+  group.by,              # Metadata column (e.g., "condition")
+  ident.1 = NULL,        # Condition A (NULL = all pairwise)
+  ident.2 = NULL,        # Condition B
+  split.by = NULL,       # Cluster variable (default: active idents)
+  reduction = "pca",
+  method = "wasserstein",# Default to distributional for this use case
+  n.perm = 0,
+  ...
+)
+```
+
+**Return:** Data frame with columns: `cluster`, `condition.1`, `condition.2`, `divergence`, `n.cells.1`, `n.cells.2`, `p.value` (if `n.perm > 0`). Sorted by divergence descending (most shifted clusters first).
+
+---
+
+## 4. Internal Architecture
+
+### 4.1 Execution Pipeline
+
+Every function in the FindSimilarity family follows a common internal pipeline with six stages:
+
+**Stage 1 — Identity Resolution.** Resolve active identities, optionally overridden by `group.by`. Validate that `ident.1` and `ident.2` exist. Retrieve the mapping from cell barcodes to cluster labels. This follows the same pattern as FindMarkers' internal `.prep_identities` step.
+
+**Stage 2 — Embedding Extraction.** Extract the embedding matrix. In reduction mode (default), pull from the specified reduction slot and subset to the requested dims. In gene-space mode (when `features` is provided), extract from the assay data slot and transpose to cells-by-features. If `dims` is NULL, auto-detect: first check if the object stores `nn.dims` from a prior `FindNeighbors` call; if not, use all available dimensions in the reduction.
+
+**Stage 3 — Cell Partitioning.** Split the embedding matrix into per-group subsets based on the resolved identities. Apply `min.cells` filtering: any group with fewer cells than the threshold is flagged with a warning and excluded from comparisons.
+
+**Stage 4 — Representation Computation.** Depending on the distance method type (centroid-based, distribution-based, or graph-based), compute the required per-group representation. For centroid methods: column means of the embedding submatrix. For distribution methods: retain the full cell-level embedding. For graph-based methods: extract relevant edges from the kNN graph stored in the Seurat object.
+
+**Stage 5 — Distance Computation.** Dispatch to the appropriate distance function via the method registry (see Section 5). Iterate over all requested comparisons. Optionally apply variance weighting to dimensions before computation.
+
+**Stage 6 — Statistical Testing (optional).** If `n.perm > 0`, run permutation testing by shuffling cluster labels within the pooled cell set, recomputing the distance under the null, and deriving empirical p-values. Apply multiple testing correction (Bonferroni and BH) when multiple comparisons are made.
+
+### 4.2 Method Registry Pattern
+
+Distance methods are organised in an internal registry that maps method names to their computation type (centroid, distribution, or graph) and their implementing function. This makes the framework extensible: adding a new distance metric requires only registering it in the list without modifying the core pipeline.
+
+Each registered method also declares its additional requirements (e.g., Mahalanobis needs the raw data for covariance estimation even though it is centroid-based; graph-based methods need a pre-computed nearest-neighbour graph), which the pipeline checks before dispatching.
+
+```r
+# Conceptual structure of the method registry
+similarity.methods <- list(
+  euclidean   = list(type = "centroid",      fn = EuclideanDistance),
+  cosine      = list(type = "centroid",      fn = CosineDistance),
+  correlation = list(type = "centroid",      fn = CorrelationDistance),
+  mahalanobis = list(type = "centroid",      fn = MahalanobisDistance,  needs.data = TRUE),
+  wasserstein = list(type = "distribution",  fn = SlicedWassersteinDistance),
+  energy      = list(type = "distribution",  fn = EnergyDistance),
+  mmd         = list(type = "distribution",  fn = MMDDistance),
+  knn_overlap = list(type = "graph",         fn = KNNOverlapDistance,   needs.graph = TRUE)
+)
+```
+
+### 4.3 Variance Weighting
+
+When `weight.by.var = TRUE` and the reduction is PCA (or any reduction with stored standard deviations / variance explained), each dimension of the embedding is scaled by the square root of its variance explained before distance computation. This gives PCs with higher eigenvalues more influence on the distance, reflecting the biological signal structure. This is an empirical design decision that must be validated (see Section 7, Experiment 1).
+
+### 4.4 Permutation Testing
+
+The null hypothesis is that cluster labels are exchangeable. For a comparison between cluster A (nA cells) and cluster B (nB cells), the permutation procedure pools all nA + nB cells, randomly reassigns nA of them to the "pseudo-A" group and nB to "pseudo-B", then recomputes the distance. Repeating this `n.perm` times yields a null distribution. The empirical p-value is `(number of null distances >= observed distance + 1) / (n.perm + 1)`.
+
+For `FindAllSimilarity` (many pairwise comparisons) and `FindDivergence` (many clusters), p-values are adjusted using both Bonferroni and Benjamini-Hochberg, reported as separate columns.
+
+---
+
+## 5. Distance Methods: Definitions and Properties
+
+### 5.1 Centroid-Based Methods
+
+These methods reduce each cluster to a single representative point (the centroid, i.e. column-wise mean of the embedding) and compute distance between centroids. They are fast and interpretable but discard information about within-cluster variance and shape.
+
+**5.1.1 Euclidean Distance.** The L2 norm between centroids:
+
+```
+d(A,B) = sqrt( Σ_i (μA_i − μB_i)² )
+```
+
+This is the most intuitive metric and serves as the baseline. It treats all embedding dimensions equally unless variance weighting is applied. It is sensitive to the magnitude of the embedding coordinates, which can be an issue when comparing across reductions with different scales.
+
+**5.1.2 Cosine Distance.** Defined as:
+
+```
+d(A,B) = 1 − cos(μA, μB)
+```
+
+where `cos` is the cosine of the angle between the two centroid vectors. This captures whether two clusters activate similar gene programs irrespective of magnitude. Useful when the "direction" in latent space matters more than the "distance" — for example, comparing cell types that differ in library complexity but share transcriptional programs.
+
+**5.1.3 Correlation Distance.** Defined as:
+
+```
+d(A,B) = 1 − cor(μA, μB)
+```
+
+using Pearson or Spearman rank correlation. Conceptually similar to cosine distance but additionally mean-centres the vectors, removing the overall "level" of the embedding. Note: for PCA embeddings that are already centred, Pearson correlation distance and cosine distance may be nearly identical. We should verify this empirically.
+
+**5.1.4 Mahalanobis Distance.** Defined as:
+
+```
+d(A,B) = sqrt( (μA − μB)ᵀ · Σ_pooled⁻¹ · (μA − μB) )
+```
+
+where `Σ_pooled` is the pooled covariance matrix. This accounts for the shape and orientation of clusters in latent space: if two clusters are elongated along the same PCA axis, Mahalanobis distance will be smaller than Euclidean. Requires inverting the covariance matrix, which is unstable when the number of cells is small relative to the number of dimensions. Regularisation (ridge or shrinkage) is needed.
+
+### 5.2 Distribution-Based Methods
+
+These methods operate on the full cell-level distributions, capturing differences in spread, shape, and density — not just the centre.
+
+**5.2.1 Wasserstein Distance (Earth Mover's Distance).** The optimal transport cost of reshaping one distribution into another. For univariate distributions this reduces to a simple sort-and-integrate operation. For multivariate embeddings (e.g., 30 PCs), exact computation is O(n³ log n) and impractical. Two practical approximations are available:
+
+- **Sliced Wasserstein:** Project both distributions onto many random 1D directions, compute 1D Wasserstein on each, average. Convergence rate is O(1/√n_projections). This is the recommended default.
+- **Per-dimension Wasserstein:** Compute 1D Wasserstein along each embedding dimension independently, then average (optionally weighted by variance explained). Ignores correlations between dimensions but is extremely fast and fully interpretable per-PC.
+
+**5.2.2 Energy Distance.** A distance between distributions based on expected pairwise differences:
+
+```
+E(A,B) = 2·E[‖X − Y‖] − E[‖X − X'‖] − E[‖Y − Y'‖]
+```
+
+where X, X' are drawn from A and Y, Y' from B. It is zero if and only if the distributions are identical. Computationally more tractable than Wasserstein for high dimensions and does not require projections. The `energy` R package provides implementations.
+
+**5.2.3 Maximum Mean Discrepancy (MMD).** A kernel-based two-sample statistic:
+
+```
+MMD²(A,B) = E[k(X,X')] + E[k(Y,Y')] − 2·E[k(X,Y)]
+```
+
+where k is a kernel (typically Gaussian RBF). Widely used in domain adaptation and batch effect detection. The choice of kernel bandwidth is critical and must be tuned or set heuristically (median distance rule). MMD has well-studied asymptotics, which could replace permutation testing with analytic p-values.
+
+### 5.3 Graph-Based Methods
+
+**5.3.1 kNN Graph Overlap.** Given the pre-computed kNN graph (from `FindNeighbors`), count the fraction of edges that connect cells in cluster A to cells in cluster B, normalised by the expected number under a random assignment. This measures topological connectivity in the manifold and is conceptually similar to PAGA. Advantage: directly uses the same graph used for clustering (UMAP, Louvain/Leiden). Disadvantage: depends heavily on the graph construction parameters (k, metric).
+
+### 5.4 Method Comparison Summary
+
+| Method | Type | Captures | Speed | Min. Cells | Key Limitation |
+|---|---|---|---|---|---|
+| Euclidean | Centroid | Center shift | Very fast | ~1 | Ignores variance/shape |
+| Cosine | Centroid | Direction | Very fast | ~1 | Ignores magnitude |
+| Correlation | Centroid | Program similarity | Very fast | ~1 | May duplicate cosine in PCA |
+| Mahalanobis | Centroid | Shape-aware | Fast | >dims | Cov. inversion unstable |
+| Sliced Wasserstein | Distribution | Full distribution | Moderate | ~30 | Stochastic (projections) |
+| Energy | Distribution | Full distribution | Moderate | ~30 | Pairwise cost O(n·m) |
+| MMD | Distribution | Kernel similarity | Moderate | ~30 | Bandwidth sensitivity |
+| kNN Overlap | Graph | Connectivity | Fast | Varies | Depends on graph params |
+
+---
+
+## 6. Open Design Decisions
+
+The following decisions cannot be made from first principles alone and require empirical testing on real and simulated data. Each is tagged with the experiment number (Section 7) that will resolve it.
+
+**Decision 1: Variance weighting of PCA dimensions.** Should the default behaviour weight each PC by its eigenvalue (variance explained) or treat all dimensions equally? Weighting amplifies the top PCs, which carry the strongest biological signal but may also carry the strongest batch effects. Equal weighting gives more influence to lower PCs, which may capture subtle but real biological variation or may contribute noise. This interacts strongly with the number of dims used. → Experiment 1.
+
+**Decision 2: Default number of dimensions.** If `dims` is NULL, should we default to all PCs in the reduction, or to the dims previously used in `FindNeighbors`, or to a data-driven selection (e.g., elbow method)? Using too many dims risks including noise PCs; using too few may miss relevant variation. → Experiment 2.
+
+**Decision 3: Default distance method.** Which method should be the default for each function? Euclidean is the simplest and most familiar, but distribution-based methods are more informative. For `FindDivergence` specifically, Wasserstein may be the more principled default since we care about distributional shift, not just centroid shift. → Experiment 3.
+
+**Decision 4: Sliced Wasserstein vs. per-dimension Wasserstein.** For the Wasserstein implementation, which approximation should be default? Sliced is more theoretically sound but stochastic. Per-dimension is deterministic, interpretable per-PC, and faster, but ignores cross-dimension correlations. → Experiment 4.
+
+**Decision 5: Mahalanobis regularisation strategy.** When cluster size is small relative to dimensionality, the covariance matrix is singular. Options: Ledoit-Wolf shrinkage, ridge regularisation (Σ + λI), or pseudo-inverse. The choice affects both numerical stability and the biological interpretation. → Experiment 5.
+
+**Decision 6: Centroid definition.** Should the centroid be the mean or the geometric median (L1 median)? The mean is the MLE for Gaussian clusters but is sensitive to outliers. The geometric median is more robust but more expensive to compute and less commonly used in the field. → Experiment 6.
+
+**Decision 7: Minimum cell threshold for reliable distance estimation.** Below what cell count are distance estimates unreliable? This likely depends on the method (centroid-based methods are more stable at low n than distribution-based). We need empirical guidance for a sensible default for `min.cells`. → Experiment 7.
+
+**Decision 8: Number of permutations for stable p-values.** What is the minimum `n.perm` for reliable p-values at various significance thresholds? Too few permutations yield unstable p-values; too many waste computation. → Experiment 8.
+
+**Decision 9: Corrected vs. uncorrected latent spaces.** When a user has both a PCA and a Harmony (or scVI) reduction, should we warn or advise which space to use? Distances in corrected space reflect biology with batch removed; distances in uncorrected space reflect biology plus batch. The "right" choice depends on the question. We should document empirical examples of when each is appropriate. → Experiment 9.
+
+---
+
+## 7. Experimental Validation Plan
+
+This section defines the experiments needed to resolve the open design decisions and to validate the framework for the methods paper. Each experiment specifies the question, datasets, procedure, metrics, and expected outcome.
+
+### 7.1 Datasets
+
+We will use a combination of real and simulated datasets to cover different scenarios:
+
+**D1 — PBMC (Seurat reference).** The 3k and 10k PBMC datasets are the most widely used Seurat tutorials. Well-characterised cell types with known relationships (e.g., CD4 T cells should be more similar to CD8 T cells than to monocytes). Serves as the primary sanity check.
+
+**D2 — Stimulated PBMC (Kang et al. 2018).** PBMC from 8 donors, stimulated with interferon-beta vs. control. Contains both cluster identity and condition (stim/ctrl). The gold standard for within-cluster condition shift analysis. Ideal for testing FindDivergence and FindConservedSimilarity.
+
+**D3 — Multi-batch integration dataset.** A dataset requiring batch correction (e.g., pancreas datasets from Luecken et al. 2022 benchmarking paper). Will have both uncorrected PCA and corrected (Harmony/scVI) embeddings. For testing Decision 9.
+
+**D4 — Developmental trajectory dataset.** A time-course or differentiation dataset (e.g., mouse gastrulation, Pijuan-Sala et al. 2019) where expected distances between clusters follow a known temporal/developmental ordering. For validating that distances recapitulate biology.
+
+**D5 — Splatter simulations.** Simulated scRNA-seq data using the Splatter R package. Advantage: ground truth is fully known — we control the true distances between groups, the number of cells per group, the amount of noise, and can create exact scenarios for each experiment. Multiple simulation configurations will be generated.
+
+---
+
+### 7.2 Experiment 1: Variance Weighting
+
+**Question:** Does weighting PCA dimensions by variance explained improve the biological accuracy of distance estimates?
+
+**Procedure:**
+
+1. Using D1 and D5, compute `FindAllSimilarity` with `method = "euclidean"` with `weight.by.var = TRUE` and `FALSE`.
+2. For D1: compare both distance matrices to a reference ordering from known cell type ontology (e.g., using Mantel test correlation with an expert-curated distance matrix).
+3. For D5: compare both to the true ground-truth distances between simulated groups.
+4. Vary the number of dims (10, 20, 30, 50, all) to test the interaction between weighting and dimensionality.
+
+**Metrics:** Mantel test r (rank correlation between computed and reference distance matrices), mean absolute error between computed and true distances (D5 only).
+
+**Expected outcome:** Weighting likely helps when using many dims (by downweighting noisy PCs) but matters less when using few dims (which are already high-variance). This determines the default for `weight.by.var`.
+
+---
+
+### 7.3 Experiment 2: Dimension Selection
+
+**Question:** How does the number of PCA dimensions affect distance accuracy, and what is a robust default?
+
+**Procedure:**
+
+1. Using D1 and D5, compute `FindAllSimilarity` with `dims = 1:k` for k in {5, 10, 15, 20, 25, 30, 40, 50, all}.
+2. For each k, compute Mantel correlation with the reference/true distances.
+3. Repeat for multiple methods (euclidean, cosine, wasserstein) to check if the optimal k varies by method.
+4. Compare the auto-detected dims (from `FindNeighbors`) vs. the empirically optimal k.
+
+**Metrics:** Mantel r as a function of k, plotted as a curve. Identify the "elbow" where adding more dims stops helping.
+
+**Expected outcome:** Performance plateaus around 20–30 dims for most methods, validating the convention of using the same dims as `FindNeighbors`.
+
+---
+
+### 7.4 Experiment 3: Method Comparison on Known Relationships
+
+**Question:** Which distance methods best recapitulate known biological relationships?
+
+**Procedure:**
+
+1. Using D1, compute the full pairwise distance matrix for all methods: euclidean, cosine, correlation, mahalanobis, sliced wasserstein, energy, MMD, kNN overlap.
+2. Create a reference distance matrix based on cell type ontology (e.g., from CellTypist or manual curation: T cell subtypes close together, myeloid vs. lymphoid far apart).
+3. Compute Mantel correlation between each method's distance matrix and the reference.
+4. Repeat on D4 (developmental) using known temporal ordering as reference.
+5. Repeat on D5 (simulation) using true distances.
+6. Compare the dendrograms produced by hierarchical clustering of each distance matrix (using `BuildClusterTree` as baseline).
+
+**Metrics:** Mantel r, Cophenetic correlation of resulting dendrograms vs. reference tree, Robinson-Foulds distance between trees.
+
+**Expected outcome:** Distribution-based methods (Wasserstein, Energy) may outperform centroid-based methods when clusters overlap or have different shapes, but centroid-based methods may be sufficient for well-separated clusters. This determines the recommended method for each use case.
+
+---
+
+### 7.5 Experiment 4: Wasserstein Approximation Comparison
+
+**Question:** Does sliced Wasserstein outperform per-dimension Wasserstein, and if so, how many projections are needed?
+
+**Procedure:**
+
+1. Using D5 (where we control the true inter-group distances and can introduce cross-PC correlations in the simulation), compute: per-dimension Wasserstein, sliced Wasserstein with n_projections = {50, 100, 200, 500, 1000, 5000}.
+2. Compare each to the true multivariate Wasserstein distance (computable on small simulations) and to each other.
+3. Measure wall-clock time for each configuration on datasets of varying size (1k, 5k, 10k, 50k cells).
+4. Test variance of sliced Wasserstein across random seeds as a function of n_projections.
+
+**Metrics:** Correlation with true Wasserstein, run time, coefficient of variation across seeds.
+
+**Expected outcome:** Sliced Wasserstein with 200–500 projections will likely converge to a stable estimate. Per-dimension Wasserstein will deviate when cross-PC correlations are strong but may be acceptable for PCA embeddings (which are uncorrelated by construction).
+
+---
+
+### 7.6 Experiment 5: Mahalanobis Regularisation
+
+**Question:** Which covariance regularisation strategy is most robust for Mahalanobis distance across different cluster sizes?
+
+**Procedure:**
+
+1. Using D5, generate clusters of varying sizes (20, 50, 100, 200, 500, 1000 cells) with known true Mahalanobis distances.
+2. Compute Mahalanobis distance using: unregularised (raw inverse, expected to fail for small n), ridge (Σ + λI for λ in {0.01, 0.1, 0.5, 1.0}), Ledoit-Wolf shrinkage (data-driven λ), pseudo-inverse (Moore-Penrose).
+3. Compare each to the true Mahalanobis distance as a function of cluster size.
+
+**Metrics:** MSE between estimated and true Mahalanobis distance, numerical stability (number of failures / warnings), sensitivity to cluster size.
+
+**Expected outcome:** Ledoit-Wolf should be the most adaptive. Ridge with moderate λ will be a simpler alternative. We'll set the default based on which provides the best trade-off of accuracy and stability.
+
+---
+
+### 7.7 Experiment 6: Centroid Robustness (Mean vs. Median)
+
+**Question:** Does using the geometric median instead of the mean improve distance estimation in the presence of outlier cells?
+
+**Procedure:**
+
+1. Using D5, simulate clusters with 0%, 5%, 10%, and 20% contamination by outlier cells (cells from a different cluster incorrectly assigned).
+2. Compute Euclidean distance using mean centroid vs. geometric median centroid.
+3. Compare to true distances.
+4. Repeat on D1 where some clusters have known doublet contamination.
+
+**Metrics:** MSE vs. true distance, breakdown by contamination level.
+
+**Expected outcome:** Geometric median will be more robust under contamination but negligibly different when clusters are clean. Given the added computational cost, we'll likely recommend mean as default with an option to switch.
+
+---
+
+### 7.8 Experiment 7: Minimum Cell Threshold
+
+**Question:** Below what cell count do distance estimates become unreliable, and does this vary by method?
+
+**Procedure:**
+
+1. Using D5, simulate pairs of clusters with known true distance. For one cluster, subsample to n = {5, 10, 20, 30, 50, 100, 200, 500} cells (the other cluster is held large at 1000 cells).
+2. For each n, compute distance using all methods, repeated 100 times with different subsamples.
+3. Measure bias (mean estimated distance minus true distance) and variance (SD of estimates) as a function of n.
+
+**Metrics:** Bias-variance decomposition by method and sample size. Coefficient of variation. Identify the n at which CV drops below 10% for each method.
+
+**Expected outcome:** Centroid-based methods will stabilise at lower n (perhaps 20–30) while distribution-based methods will need more cells (50–100). This sets the `min.cells` default.
+
+---
+
+### 7.9 Experiment 8: Permutation Test Calibration
+
+**Question:** How many permutations are needed for stable p-values?
+
+**Procedure:**
+
+1. Using D5, create scenarios with known significant and non-significant distances.
+2. Run permutation tests with `n.perm` = {100, 200, 500, 1000, 2000, 5000, 10000}.
+3. For each `n.perm`, repeat 50 times and measure the variance of the resulting p-values.
+4. Check calibration: under the null (clusters drawn from same distribution), are p-values uniformly distributed?
+
+**Metrics:** P-value variance, QQ-plot calibration under null, power at α = 0.05 and 0.01.
+
+**Expected outcome:** `n.perm = 1000` should be sufficient for p = 0.05 significance; `n.perm = 5000` for p = 0.01. Default recommendation will follow.
+
+---
+
+### 7.10 Experiment 9: Corrected vs. Uncorrected Spaces
+
+**Question:** How do distances differ between corrected (e.g., Harmony) and uncorrected (PCA) embeddings, and when does each give biologically correct answers?
+
+**Procedure:**
+
+1. Using D3 (multi-batch), compute `FindAllSimilarity` in PCA space and in Harmony space.
+2. Compare the distance matrices: are they correlated? Which clusters change rank order between spaces?
+3. Using D2 (stimulated PBMC), run `FindDivergence` in both PCA and Harmony spaces. The biological expectation is that interferon-stimulated cells should show divergence in specific cell types.
+4. Assess which space better recovers known biology.
+
+**Metrics:** Mantel r between distance matrices in different spaces, rank-order agreement, biological concordance with known condition effects.
+
+**Expected outcome:** Corrected space will give cleaner cluster-to-cluster distances (batch effects removed), but may underestimate condition divergence if the correction is too aggressive. This will inform documentation and recommendations.
+
+---
+
+### 7.11 Experiment 10: FindDivergence Validation
+
+**Question:** Can FindDivergence correctly identify clusters with the strongest condition-specific shifts?
+
+**Procedure:**
+
+1. Using D2 (Kang et al.), run `FindDivergence` with `group.by = "stim"` across all clusters, testing multiple methods.
+2. Rank clusters by divergence. Cross-reference with published analyses that identify the most responsive cell types to interferon-beta stimulation.
+3. Using D5, simulate a dataset where specific clusters have large condition shifts and others have none. Assess whether FindDivergence correctly identifies the shifted clusters at various effect sizes.
+4. Test the interaction with cluster size: does a larger cluster get artificially higher/lower divergence?
+
+**Metrics:** Rank correlation with known responsive cell types, precision@k (are the top-k most divergent clusters truly the shifted ones?), independence from cluster size.
+
+---
+
+### 7.12 Experiment 11: Scalability Benchmark
+
+**Question:** How does computation time scale with dataset size and number of clusters?
+
+**Procedure:**
+
+1. Generate simulated datasets with varying n_cells = {1k, 5k, 10k, 50k, 100k, 500k} and n_clusters = {5, 10, 20, 50}.
+2. Benchmark `FindAllSimilarity` wall-clock time for each method.
+3. Benchmark `FindDivergence` wall-clock time with varying n_conditions = {2, 3, 5}.
+4. Benchmark permutation testing time as a function of `n.perm` and dataset size.
+
+**Metrics:** Wall-clock time, peak memory usage. Plotted as scaling curves.
+
+**Expected outcome:** Centroid methods should be near-instant even at 500k cells. Distribution methods will scale linearly with cells per cluster. Permutation testing will be the bottleneck. This informs whether we need to implement subsampling for large clusters.
+
+---
+
+## 8. Implementation Roadmap
+
+### 8.1 Phase 1: Core Engine (Weeks 1–2)
+
+- Implement `FindSimilarity` with Euclidean and cosine distance (centroid-based).
+- Implement `FindAllSimilarity` wrapper returning a distance matrix.
+- Build the method registry / dispatcher pattern.
+- Unit tests: validate Euclidean and cosine against hand-computed examples.
+- Integration test: compare `FindAllSimilarity` Euclidean dendrogram to `BuildClusterTree` output.
+
+### 8.2 Phase 2: Distribution Methods (Weeks 3–4)
+
+- Implement sliced Wasserstein and per-dimension Wasserstein.
+- Implement Energy distance.
+- Implement Mahalanobis with Ledoit-Wolf regularisation.
+- Run Experiments 1–6 to resolve design decisions.
+- Set defaults based on experimental results.
+
+### 8.3 Phase 3: Condition Analysis (Weeks 5–6)
+
+- Implement `FindDivergence`.
+- Implement `FindConservedSimilarity`.
+- Implement permutation testing.
+- Run Experiments 7–10.
+
+### 8.4 Phase 4: Polish and Paper (Weeks 7–8)
+
+- Run scalability benchmarks (Experiment 11).
+- Implement visualisation helpers (distance heatmap, divergence bar plot, enhanced dendrogram).
+- Write documentation and vignettes.
+- Draft methods paper.
+- Prepare PR for Seurat repository.
+
+### 8.5 R Package Dependencies
+
+The implementation should minimise new dependencies. Current assessment:
+
+- **No new dependencies required:** Euclidean, cosine, correlation, per-dimension Wasserstein, kNN overlap (uses existing Seurat graph).
+- **Suggested (optional):** `transport` (for Wasserstein utilities), `energy` (for energy distance), `corpcor` (for Ledoit-Wolf shrinkage).
+- **Consideration:** All optional dependencies should be handled with graceful failure via `requireNamespace()` checks, consistent with Seurat's existing approach.
+
+---
+
+## 9. Methods Paper Outline
+
+The experimental validation in Section 7 directly feeds into a methods paper. Proposed structure:
+
+**Title:** FindSimilarity: Quantifying Inter-Cluster Distances and Condition-Specific Divergence in Single-Cell Latent Spaces
+
+**Abstract:** UMAPs don't preserve global distances; we present a framework that quantifies distances in latent space, supporting multiple metrics, condition-stratified analysis, and statistical testing.
+
+**Introduction:** Motivation (the UMAP global distance problem), gap analysis (Section 2 of this document), and a brief overview of the framework.
+
+**Methods:** API design, distance metrics (mathematical definitions), permutation testing framework, implementation details.
+
+**Results:**
+
+- Benchmarking distance metrics on known cell type relationships (Experiment 3).
+- Variance weighting and dimension selection (Experiments 1–2).
+- Wasserstein approximation comparison (Experiment 4).
+- Condition-specific divergence detection (Experiment 10) — the key biological result.
+- Scalability (Experiment 11).
+
+**Discussion:** Recommendations for when to use each metric, limitations (assumptions about latent space quality), relationship to PAGA and other tools, future directions (multi-modal, spatial).
+
+**Data and Code Availability:** All code as a Seurat PR + standalone R package. Simulation scripts and analysis notebooks on GitHub.
+
+---
+
+## 10. Risks and Mitigations
+
+| Risk | Severity | Mitigation |
+|---|---|---|
+| Seurat maintainers reject the PR scope | High | Engage early with Seurat team. Alternatively, release as a standalone package (SeuratSimilarity) that extends Seurat objects via S3 methods. |
+| Distribution methods too slow for large datasets | Medium | Implement per-cluster subsampling (e.g., max 1000 cells per cluster). Benchmark early (Experiment 11). |
+| No single method dominates across all scenarios | Low | This is actually expected and is a feature: document which method suits which question. The paper becomes stronger as a comparative guide. |
+| Permutation testing computationally prohibitive | Medium | Offer analytic p-values for MMD (asymptotic distribution is known). Use permutations only where needed. |
+| Biological validation is ambiguous (no absolute ground truth for real data) | Medium | Combine simulated data (known ground truth) with real data (known biology). Use multiple real datasets. Focus on relative ordering, not absolute values. |
+
+---
+
+## 11. Glossary
+
+**Centroid:** The mean position of all cells in a cluster within the embedding space. A single vector summarising the cluster's location.
+
+**Divergence:** In this framework, the distance between sub-populations within a single cluster, split by a condition variable. Measures how much a cluster shifts between conditions.
+
+**Earth Mover's Distance (EMD):** Synonym for Wasserstein distance. The minimum cost of transforming one probability distribution into another.
+
+**Latent space:** A lower-dimensional representation of gene expression data. PCA, Harmony, and scVI embeddings are examples.
+
+**Mantel test:** A statistical test of the correlation between two distance matrices. Used to compare computed distances against reference/true distances.
+
+**Sliced Wasserstein distance:** An approximation of multivariate Wasserstein distance computed by averaging 1D Wasserstein distances over many random projections.
+
+**Similarity:** In this framework, the inverse of distance. FindSimilarity returns distances but is named for the biological question it answers: "How similar are these clusters?"
+
+---
+
+*End of Document*
