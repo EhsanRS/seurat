@@ -150,6 +150,7 @@ Collate:
     'preprocessing.R'
     'preprocessing5.R'
     'roxygen.R'
+    'similarity.R'
     'sketching.R'
     'tree.R'
     'utilities.R'

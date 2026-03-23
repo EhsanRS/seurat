@@ -168,6 +168,30 @@ FindMarkers <- function(object, ...) {
   UseMethod(generic = 'FindMarkers', object = object)
 }
 
+#' Inter-cluster distance in latent space
+#'
+#' Compute distance between clusters in a reduced-dimension embedding space.
+#' Supports multiple distance methods including centroid-based (euclidean,
+#' cosine, correlation) metrics. When \code{ident.2} is NULL, computes
+#' distance from \code{ident.1} to all other clusters.
+#'
+#' @param object An object
+#' @param ... Arguments passed to other methods
+#'
+#' @return A data.frame containing cluster pair distances and associated
+#' statistics, sorted by distance ascending (most similar first)
+#'
+#' @export
+#'
+#' @concept similarity
+#'
+#' @rdname FindSimilarity
+#' @export FindSimilarity
+#'
+FindSimilarity <- function(object, ...) {
+  UseMethod(generic = 'FindSimilarity', object = object)
+}
+
 #' (Shared) Nearest-neighbor graph construction
 #'
 #' Computes the \code{k.param} nearest neighbors for a given dataset. Can also
